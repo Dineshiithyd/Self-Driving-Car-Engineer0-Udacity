@@ -1,0 +1,182 @@
+#include <iostream>
+#include <fstream>
+#include <cmath>
+#include <vector>
+
+#include "json.hpp"
+#include "Eigen/QR"
+#include "uWS/uWS.h"
+
+#include <carla/client/ActorBlueprint.h>
+#include <carla/client/BlueprintLibrary.h>
+#include <carla/client/Client.h>
+#include <carla/client/Map.h>
+#include <carla/client/Sensor.h>
+#include <carla/client/TimeoutException.h>
+#include <carla/client/World.h>
+#include <carla/geom/Transform.h>
+#include <carla/image/ImageIO.h>
+#include <carla/image/ImageView.h>
+#include <carla/sensor/data/Image.h>
+
+#include "behavior_planner_FSM.h"
+#include "motion_planner.h"
+#include "planning_params.h"
+#include "utils.h"
+#include "pid_controller.h"
+
+using namespace std;
+using json = nlohmann::json;
+
+string hasData(const string& s) {
+    auto found_null = s.find("null");
+    auto b1 = s.find_first_of("{");
+    auto b2 = s.find_first_of("}");
+    if (found_null != string::npos) {
+        return "";
+    } else if (b1 != string::npos && b2 != string::npos) {
+        return s.substr(b1, b2 - b1 + 1);
+    }
+    return "";
+}
+
+template <typename T>
+int sgn(T val) {
+    return (T(0) < val) - (val < T(0));
+}
+
+double angleBetweenPoints(double x1, double y1, double x2, double y2) {
+    return atan2(y2 - y1, x2 - x1);
+}
+
+BehaviorPlannerFSM behaviorPlanner(
+    P_LOOKAHEAD_TIME, P_LOOKAHEAD_MIN, P_LOOKAHEAD_MAX, P_SPEED_LIMIT,
+    P_STOP_THRESHOLD_SPEED, P_REQ_STOPPED_TIME, P_REACTION_TIME,
+    P_MAX_ACCEL, P_STOP_LINE_BUFFER
+);
+
+MotionPlanner motionPlanner(P_NUM_PATHS, P_GOAL_OFFSET, P_ERR_TOLERANCE);
+
+bool haveObstacle = false;
+vector<State> obstacles;
+vector<vector<PathPoint>> backupSpirals;
+
+void pathPlanner(
+    vector<double>& xPoints, vector<double>& yPoints, vector<double>& vPoints,
+    double yaw, double velocity, State goal, bool isJunction, string tlState,
+    vector<vector<double>>& spiralsX, vector<vector<double>>& spiralsY,
+    vector<vector<double>>& spiralsV, vector<int>& bestSpirals
+) {
+    State egoState;
+
+    egoState.location.x = xPoints[xPoints.size() - 1];
+    egoState.location.y = yPoints[yPoints.size() - 1];
+    egoState.velocity.x = velocity;
+
+    if (xPoints.size() > 1) {
+        egoState.rotation.yaw = angleBetweenPoints(
+            xPoints[xPoints.size() - 2], yPoints[yPoints.size() - 2],
+            xPoints[xPoints.size() - 1], yPoints[yPoints.size() - 1]
+        );
+        egoState.velocity.x = vPoints[vPoints.size() - 1];
+        if (velocity < 0.01) {
+            egoState.rotation.yaw = yaw;
+        }
+    }
+
+    Maneuver behavior = behaviorPlanner.getActiveManeuver();
+
+    goal = behaviorPlanner.stateTransition(egoState, goal, isJunction, tlState);
+
+    if (behavior == STOPPED) {
+        int maxPoints = 20;
+        double pointX = xPoints[xPoints.size() - 1];
+        double pointY = yPoints[xPoints.size() - 1];
+        while (xPoints.size() < maxPoints) {
+            xPoints.push_back(pointX);
+            yPoints.push_back(pointY);
+            vPoints.push_back(0);
+        }
+        return;
+    }
+
+    auto goalSet = motionPlanner.generateOffsetGoals(goal);
+
+    auto spirals = motionPlanner.generateSpirals(egoState, goalSet);
+
+    auto desiredSpeed = utils::magnitude(goal.velocity);
+
+    State leadCarState;
+
+    if (spirals.size() == 0) {
+        cout << "Error: No spirals generated " << endl;
+        return;
+    }
+
+    for (int i = 0; i < spirals.size(); i++) {
+        auto trajectory = motionPlanner.velocityProfileGenerator.generateTrajectory(
+            spirals[i], desiredSpeed, egoState, leadCarState, behavior
+        );
+
+        vector<double> spiralX;
+        vector<double> spiralY;
+        vector<double> spiralV;
+        for (int j = 0; j < trajectory.size(); j++) {
+            double pointX = trajectory[j].path_point.x;
+            double pointY = trajectory[j].path_point.y;
+            double velocity = trajectory[j].v;
+            spiralX.push_back(pointX);
+            spiralY.push_back(pointY);
+            spiralV.push_back(velocity);
+        }
+
+        spiralsX.push_back(spiralX);
+        spiralsY.push_back(spiralY);
+        spiralsV.push_back(spiralV);
+    }
+
+    bestSpirals = motionPlanner.getBestSpiralIdx(spirals, obstacles, goal);
+    int bestSpiralIdx = -1;
+
+    if (bestSpirals.size() > 0) {
+        bestSpiralIdx = bestSpirals[bestSpirals.size() - 1];
+    }
+
+    int index = 0;
+    int maxPoints = 20;
+    int addPoints = spiralsX[bestSpiralIdx].size();
+    while (xPoints.size() < maxPoints && index < addPoints) {
+        double pointX = spiralsX[bestSpiralIdx][index];
+        double pointY = spiralsY[bestSpiralIdx][index];
+        double velocity = spiralsV[bestSpiralIdx][index];
+        index++;
+        xPoints.push_back(pointX);
+        yPoints.push_back(pointY);
+        vPoints.push_back(velocity);
+    }
+}
+
+void setObstacles(const vector<double>& xPoints, const vector<double>& yPoints,
+    vector<State>& obstacles, bool& obstacleFlag
+) {
+    for (int i = 0; i < xPoints.size(); i++) {
+        State obstacle;
+        obstacle.location.x = xPoints[i];
+        obstacle.location.y = yPoints[i];
+        obstacles.push_back(obstacle);
+    }
+    obstacleFlag = true;
+}
+
+double correctAngle(double angle) {
+    while (abs(angle) > M_PI) {
+        if (angle < -M_PI) angle += 2 * M_PI;
+        if (angle > M_PI) angle -= 2 * M_PI;
+    }
+    return angle;
+}
+
+int main() {
+  
+    return 0;
+}
